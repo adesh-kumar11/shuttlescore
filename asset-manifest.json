@@ -1,10 +1,10 @@
 {
   "files": {
-    "main.js": "/shuttlescore/static/js/main.d4c3c6af.js",
+    "main.js": "/shuttlescore/static/js/main.ebb3a061.js",
     "index.html": "/shuttlescore/index.html",
-    "main.d4c3c6af.js.map": "/shuttlescore/static/js/main.d4c3c6af.js.map"
+    "main.ebb3a061.js.map": "/shuttlescore/static/js/main.ebb3a061.js.map"
   },
   "entrypoints": [
-    "static/js/main.d4c3c6af.js"
+    "static/js/main.ebb3a061.js"
   ]
 }
