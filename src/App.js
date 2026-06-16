@@ -4,116 +4,12 @@ import {
   subscribeLiveMatch, subscribePlayers, subscribeTeams, subscribeHistory, subscribeTournament
 } from "./firebase";
 
-// ─── GAME LOGIC ───────────────────────────────────────────────────────────────
-const WIN_BY=2,MAX_PTS=21,DEUCE_CAP=30;
-const gw=(a,b)=>((a>=MAX_PTS||a===DEUCE_CAP)&&a-b>=WIN_BY)?"A":((b>=MAX_PTS||b===DEUCE_CAP)&&b-a>=WIN_BY)?"B":null;
-const mw=(sets,n)=>sets.filter(s=>s.winner==="A").length>=n?"A":sets.filter(s=>s.winner==="B").length>=n?"B":null;
-const shuffle=a=>{const r=[...a];for(let i=r.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[r[i],r[j]]=[r[j],r[i]];}return r;};
-
-// ─── TOURNAMENT ENGINE ────────────────────────────────────────────────────────
-const mkMatch=(id,a,b)=>({id:`m${id}`,teamA:a,teamB:b,scoreA:null,scoreB:null,winner:null,status:"pending",isBye:false,setsDetail:""});
-const mkBye=(id,team)=>({id:`b${id}`,teamA:team,teamB:null,scoreA:null,scoreB:null,winner:team,status:"bye",isBye:true,setsDetail:""});
-
-function buildKnockout(teams){
-  const pow2=Math.pow(2,Math.ceil(Math.log2(Math.max(teams.length,2))));
-  const seeded=[...shuffle(teams)];
-  while(seeded.length<pow2)seeded.push(null);
-  const r1=[];
-  for(let i=0;i<seeded.length;i+=2){
-    const a=seeded[i],b=seeded[i+1];
-    r1.push(!b?mkBye(i/2,a):mkMatch(i/2,a,b));
-  }
-  const rounds=[];let cur=r1,ri=0;
-  while(cur.length>=1){
-    const name=cur.length===1?"🏆 Final":cur.length===2?"Semi-Finals":cur.length===4?"Quarter-Finals":`Round of ${cur.length*2}`;
-    rounds.push({name,matches:cur});
-    if(cur.length===1)break;
-    const next=[];
-    for(let i=0;i<cur.length;i+=2)next.push(mkMatch(ri*100+i/2,"TBD","TBD"));
-    cur=next;ri++;
-  }
-  return{type:"knockout",rounds};
-}
-
-function buildRoundRobin(teams){
-  const t=[...teams];if(t.length%2)t.push(null);
-  const rounds=[];
-  for(let r=0;r<t.length-1;r++){
-    const matches=[];
-    for(let i=0;i<t.length/2;i++){
-      const a=t[i],b=t[t.length-1-i];
-      if(a&&b)matches.push(mkMatch(r*100+i,a,b));
-      else if(a||b)matches.push(mkBye(r*100+i,a||b));
-    }
-    rounds.push({name:`Round ${r+1}`,matches});
-    t.splice(1,0,t.pop());
-  }
-  return{type:"round-robin",rounds};
-}
-
-function buildQualifier(teams,topN){
-  const groupSize=4;const groups=[];
-  for(let i=0;i<teams.length;i+=groupSize)groups.push(teams.slice(i,i+groupSize));
-  const groupStages=groups.map((g,gi)=>{const rr=buildRoundRobin(g);return{groupName:`Group ${String.fromCharCode(65+gi)}`,rounds:rr.rounds};});
-  const knockoutTeams=Array.from({length:topN},(_,i)=>`Q${i+1}`);
-  const ko=buildKnockout(knockoutTeams);
-  return{type:"qualifier",groups:groupStages,knockout:ko,topN,groupsDone:false};
-}
-
-function propagateKnockout(rounds){
-  const r=rounds.map(rnd=>({...rnd,matches:[...rnd.matches.map(m=>({...m}))]}));
-  for(let ri=0;ri<r.length-1;ri++){
-    const cur=r[ri].matches,next=r[ri+1].matches;
-    for(let mi=0;mi<cur.length;mi+=2){
-      const m1=cur[mi],m2=cur[mi+1]||{winner:null};
-      const slot=next[Math.floor(mi/2)];
-      if(!slot)continue;
-      const prevA=slot.teamA,prevB=slot.teamB;
-      slot.teamA=m1.winner||"TBD";
-      slot.teamB=m2.winner||"TBD";
-      if(slot.teamA!==prevA||slot.teamB!==prevB){slot.winner=null;slot.status="pending";slot.scoreA=null;slot.scoreB=null;slot.setsDetail="";}
-    }
-  }
-  return r;
-}
-
-function rrStandingsCalc(matches,teamNames){
-  const t={};teamNames.forEach(n=>{t[n]={w:0,l:0,d:0,pts:0,f:0,a:0,pd:0};});
-  matches.forEach(m=>{
-    if(m.status!=="done"||m.isBye)return;
-    const a=parseInt(m.scoreA),b=parseInt(m.scoreB);
-    if(isNaN(a)||isNaN(b))return;
-    if(t[m.teamA]){t[m.teamA].f+=a;t[m.teamA].a+=b;t[m.teamA].pd+=a-b;}
-    if(t[m.teamB]){t[m.teamB].f+=b;t[m.teamB].a+=a;t[m.teamB].pd+=b-a;}
-    if(a>b){if(t[m.teamA]){t[m.teamA].w++;t[m.teamA].pts+=3;}if(t[m.teamB])t[m.teamB].l++;}
-    else if(b>a){if(t[m.teamB]){t[m.teamB].w++;t[m.teamB].pts+=3;}if(t[m.teamA])t[m.teamA].l++;}
-    else{if(t[m.teamA]){t[m.teamA].d++;t[m.teamA].pts++;}if(t[m.teamB]){t[m.teamB].d++;t[m.teamB].pts++;}}
-  });
-  return Object.entries(t).sort((a,b)=>b[1].pts-a[1].pts||b[1].pd-a[1].pd);
-}
-
-function computeStats(history,players){
-  const pS={},tS={};
-  players.forEach(p=>{pS[p]={wins:0,losses:0,matches:0,setsWon:0,pointsWon:0,pointsLost:0};});
-  history.forEach(m=>{
-    const kA=m.teamA.name,kB=m.teamB.name;
-    if(!tS[kA])tS[kA]={wins:0,losses:0,setsWon:0,pointsWon:0,pointsLost:0,players:m.teamA.players};
-    if(!tS[kB])tS[kB]={wins:0,losses:0,setsWon:0,pointsWon:0,pointsLost:0,players:m.teamB.players};
-    const aw=m.winner==="A";
-    if(aw){tS[kA].wins++;tS[kB].losses++;}else{tS[kB].wins++;tS[kA].losses++;}
-    m.sets.forEach(s=>{
-      tS[kA].setsWon+=s.winner==="A"?1:0;tS[kA].pointsWon+=s.scoreA;tS[kA].pointsLost+=s.scoreB;
-      tS[kB].setsWon+=s.winner==="B"?1:0;tS[kB].pointsWon+=s.scoreB;tS[kB].pointsLost+=s.scoreA;
-    });
-    [...m.teamA.players,...m.teamB.players].forEach(p=>{
-      if(!pS[p])pS[p]={wins:0,losses:0,matches:0,setsWon:0,pointsWon:0,pointsLost:0};pS[p].matches++;
-    });
-    [{pl:m.teamA.players,won:aw},{pl:m.teamB.players,won:!aw}].forEach(({pl,won})=>
-      pl.forEach(p=>{if(!pS[p])pS[p]={wins:0,losses:0,matches:0,setsWon:0,pointsWon:0,pointsLost:0};if(won)pS[p].wins++;else pS[p].losses++;})
-    );
-  });
-  return{pS,tS};
-}
+import {
+  gw, mw, shuffle,
+  mkMatch, mkBye,
+  buildKnockout, buildRoundRobin, buildQualifier,
+  propagateKnockout, rrStandingsCalc, computeStats
+} from "./gameLogic";
 
 // ─── TOKENS ──────────────────────────────────────────────────────────────────
 const C={
@@ -263,7 +159,10 @@ option{background:${C.surf};color:${C.txt}}
 .reg-acts{display:flex;gap:4px;flex-shrink:0}
 
 /* ── VISUAL BRACKET ── */
-.bracket-wrap{overflow-x:auto;overflow-y:visible;padding:4px 4px 8px;margin-bottom:10px;-webkit-overflow-scrolling:touch}
+.bracket-wrap{overflow-x:auto;overflow-y:visible;padding:6px 6px 12px;margin-bottom:10px;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:#1e3a52 transparent}
+.bracket-wrap::-webkit-scrollbar{height:4px}
+.bracket-wrap::-webkit-scrollbar-track{background:transparent}
+.bracket-wrap::-webkit-scrollbar-thumb{background:#1e3a52;border-radius:4px}
 .bracket-wrap svg{display:block;overflow:visible}
 
 /* Bracket node box */
@@ -401,11 +300,11 @@ function Scoreboard({tA,tB,sA,sB,sets,serving,setsToWin}){
 
 // ─── VISUAL KNOCKOUT BRACKET ─────────────────────────────────────────────────
 function KnockoutBracket({rounds,isRef,onLaunch,onSwap,onBye}){
-  const BOX_W=148,BOX_H=60,GAP_X=48,BTN_H=22,LABEL_H=28,PAD=10;
+  const BOX_W=166,BOX_H=70,GAP_X=66,LABEL_H=36,PAD=12;
+  // unit = vertical space allocated per R0 slot (box + 2-row buttons + breathing room)
+  const unit=152;
   const r0n=rounds[0]?.matches.length||1;
-  const unit=BOX_H+16; // verified: produces perfectly aligned connectors
 
-  // Position: center each match over its span of R0 slots
   const getPos=(ri,mi)=>{
     const slotsPerMatch=r0n/rounds[ri].matches.length;
     const firstSlot=mi*slotsPerMatch;
@@ -415,9 +314,8 @@ function KnockoutBracket({rounds,isRef,onLaunch,onSwap,onBye}){
   };
 
   const svgW=PAD*2+rounds.length*(BOX_W+GAP_X)-GAP_X;
-  const svgH=LABEL_H+PAD+r0n*unit+BTN_H+PAD*2;
+  const svgH=LABEL_H+PAD+r0n*unit+PAD*2;
 
-  // Connector lines — verified correct in tests
   const connectors=rounds.slice(0,-1).flatMap((rnd,ri)=>
     rnd.matches.map((_,mi)=>{
       if(mi%2!==0)return null;
@@ -426,11 +324,14 @@ function KnockoutBracket({rounds,isRef,onLaunch,onSwap,onBye}){
       const x1=p1.x+BOX_W, y1=p1.y+BOX_H/2;
       const x2=p2.x+BOX_W, y2=p2.y+BOX_H/2;
       const midX=x1+GAP_X/2;
-      const xN=pN.x,       yN=pN.y+BOX_H/2;
+      const xN=pN.x, yN=pN.y+BOX_H/2;
+      const bothDone=rounds[ri].matches[mi]?.status==="done"&&rounds[ri].matches[mi+1]?.status==="done";
+      const lineCol=bothDone?C.gr+"88":C.bdrBr;
       return(
         <g key={`c${ri}-${mi}`}>
-          <polyline points={`${x1},${y1} ${midX},${y1} ${midX},${y2} ${x2},${y2}`} fill="none" stroke={C.bdrBr} strokeWidth="1.5"/>
-          <line x1={midX} y1={(y1+y2)/2} x2={xN} y2={yN} stroke={C.bdrBr} strokeWidth="1.5"/>
+          <polyline points={`${x1},${y1} ${midX},${y1} ${midX},${y2} ${x2},${y2}`}
+            fill="none" stroke={lineCol} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+          <line x1={midX} y1={(y1+y2)/2} x2={xN} y2={yN} stroke={lineCol} strokeWidth="2" strokeLinecap="round"/>
         </g>
       );
     }).filter(Boolean)
@@ -439,14 +340,22 @@ function KnockoutBracket({rounds,isRef,onLaunch,onSwap,onBye}){
   return(
     <div className="bracket-wrap">
       <svg width={svgW} height={svgH} style={{display:"block",minWidth:svgW}}>
-        {/* Round labels */}
-        {rounds.map((rnd,ri)=>(
-          <text key={`lbl${ri}`} x={PAD+ri*(BOX_W+GAP_X)+BOX_W/2} y={LABEL_H} textAnchor="middle"
-            fill={C.txtD} fontSize="9" fontWeight="700" fontFamily="DM Sans,sans-serif" letterSpacing="1">
-            {rnd.name.replace("🏆 ","").toUpperCase()}
-          </text>
-        ))}
+        {/* Round column headers */}
+        {rounds.map((rnd,ri)=>{
+          const lx=PAD+ri*(BOX_W+GAP_X);
+          return(
+            <g key={`lbl${ri}`}>
+              <text x={lx+BOX_W/2} y={LABEL_H-12} textAnchor="middle"
+                fill={C.txtD} fontSize="10" fontWeight="700" fontFamily="DM Sans,sans-serif" letterSpacing="1.5">
+                {rnd.name.replace("🏆 ","").toUpperCase()}
+              </text>
+              <rect x={lx} y={LABEL_H-5} width={BOX_W} height="2" rx="1" fill={C.bdr}/>
+            </g>
+          );
+        })}
+
         {connectors}
+
         {rounds.map((rnd,ri)=>rnd.matches.map((match,mi)=>{
           const{x,y}=getPos(ri,mi);
           const done=match.status==="done";
@@ -454,74 +363,97 @@ function KnockoutBracket({rounds,isRef,onLaunch,onSwap,onBye}){
           const wA=done&&match.winner===match.teamA;
           const wB=done&&match.winner===match.teamB;
           const tbd=!bye&&(match.teamA==="TBD"||match.teamB==="TBD");
-          const nameA=(match.teamA||"TBD").slice(0,15);
-          const nameB=bye?"BYE":(match.teamB||"TBD").slice(0,15);
+          const nameA=(match.teamA||"TBD").slice(0,17);
+          const nameB=bye?"BYE":(match.teamB||"TBD").slice(0,17);
           const scoreA=done?String(match.scoreA):"";
           const scoreB=done?String(match.scoreB):"";
+
+          // Two-row button positions
+          const bW=Math.floor((BOX_W-8)/3); // ~52px each for 3 buttons
+          const btnY1=y+BOX_H+14; // Play row
+          const btnY2=y+BOX_H+44; // Swap / Bye row
+
           return(
-            <g key={match.id}>
-              {/* Box */}
-              <rect x={x} y={y} width={BOX_W} height={BOX_H} rx="8"
-                fill={done?"#0d1b2a":C.surf}
-                stroke={done?C.gr:bye?"#1e3a5288":C.bdr}
-                strokeWidth={done?"1.5":"1"} opacity={bye?.55:1}/>
+            <g key={match.id} opacity={bye?0.5:1}>
+              {/* Subtle glow on completed matches */}
+              {done&&<rect x={x-2} y={y-2} width={BOX_W+4} height={BOX_H+4} rx="11" fill={C.gr} opacity=".08"/>}
+
+              {/* Card background */}
+              <rect x={x} y={y} width={BOX_W} height={BOX_H} rx="9"
+                fill={done?"#0c1d30":bye?"#0a1520":C.surf}
+                stroke={done?C.gr:tbd?C.bdrBr:C.bdr}
+                strokeWidth={done?1.5:1}
+                strokeDasharray={tbd?"6 3":undefined}/>
+
               {/* Winner row highlight */}
-              {wA&&<rect x={x+1} y={y+1} width={BOX_W-2} height={BOX_H/2-1} rx="7" fill={C.gr} opacity=".14"/>}
-              {wB&&<rect x={x+1} y={y+BOX_H/2} width={BOX_W-2} height={BOX_H/2-1} rx="7" fill={C.gr} opacity=".14"/>}
+              {wA&&<rect x={x+1} y={y+1} width={BOX_W-2} height={BOX_H/2-1} rx="8" fill={C.gr} opacity=".14"/>}
+              {wB&&<rect x={x+1} y={y+BOX_H/2+1} width={BOX_W-2} height={BOX_H/2-2} rx="7" fill={C.gr} opacity=".14"/>}
+
               {/* Team A */}
-              <text x={x+9} y={y+BOX_H/4+5} dominantBaseline="middle"
-                fill={wA?C.gr:tbd?C.txtD+"88":C.txt}
-                fontSize="11" fontWeight={wA?"700":"500"} fontFamily="DM Sans,sans-serif">
+              <text x={x+10} y={y+BOX_H/4+5} dominantBaseline="middle"
+                fill={wA?C.gr:tbd?C.txtD:C.txt}
+                fontSize={tbd?10:12} fontWeight={wA?700:600} fontFamily="DM Sans,sans-serif">
                 {nameA}
               </text>
-              {scoreA&&<text x={x+BOX_W-7} y={y+BOX_H/4+5} dominantBaseline="middle" textAnchor="end"
-                fill={wA?C.gr:C.txtD} fontSize="12" fontWeight="700" fontFamily="JetBrains Mono,monospace">{scoreA}</text>}
+              {scoreA&&<text x={x+BOX_W-9} y={y+BOX_H/4+5} dominantBaseline="middle" textAnchor="end"
+                fill={wA?C.gr:C.txtM} fontSize="14" fontWeight="700" fontFamily="JetBrains Mono,monospace">{scoreA}</text>}
+
               {/* Divider */}
-              <line x1={x+4} y1={y+BOX_H/2} x2={x+BOX_W-4} y2={y+BOX_H/2} stroke={C.bdr} strokeWidth="1"/>
+              <line x1={x+6} y1={y+BOX_H/2} x2={x+BOX_W-6} y2={y+BOX_H/2}
+                stroke={done?C.bdrBr:C.bdr} strokeWidth="1"/>
+
               {/* Team B */}
-              <text x={x+9} y={y+BOX_H*3/4+5} dominantBaseline="middle"
-                fill={wB?C.gr:tbd||bye?C.txtD+"88":C.txt}
-                fontSize="11" fontWeight={wB?"700":"500"} fontFamily="DM Sans,sans-serif">
+              <text x={x+10} y={y+BOX_H*3/4+5} dominantBaseline="middle"
+                fill={wB?C.gr:tbd||bye?C.txtD:C.txt}
+                fontSize={tbd||bye?10:12} fontWeight={wB?700:600} fontFamily="DM Sans,sans-serif">
                 {nameB}
               </text>
-              {scoreB&&<text x={x+BOX_W-7} y={y+BOX_H*3/4+5} dominantBaseline="middle" textAnchor="end"
-                fill={wB?C.gr:C.txtD} fontSize="12" fontWeight="700" fontFamily="JetBrains Mono,monospace">{scoreB}</text>}
-              {/* Sets detail */}
+              {scoreB&&<text x={x+BOX_W-9} y={y+BOX_H*3/4+5} dominantBaseline="middle" textAnchor="end"
+                fill={wB?C.gr:C.txtM} fontSize="14" fontWeight="700" fontFamily="JetBrains Mono,monospace">{scoreB}</text>}
+
+              {/* Sets detail chip */}
               {done&&match.setsDetail&&(
-                <text x={x+BOX_W/2} y={y+BOX_H+10} textAnchor="middle"
-                  fill={C.txtD} fontSize="8" fontFamily="JetBrains Mono,monospace">{match.setsDetail}</text>
+                <text x={x+BOX_W/2} y={y+BOX_H+9} textAnchor="middle"
+                  fill={C.gr+"99"} fontSize="8.5" fontFamily="JetBrains Mono,monospace">{match.setsDetail}</text>
               )}
-              {/* Action buttons - referee, non-TBD, non-bye */}
+
+              {/* Action buttons — referee only, non-TBD, non-bye */}
               {isRef&&!tbd&&!bye&&(
                 <g>
-                  {/* Play button */}
-                  <rect x={x+2} y={y+BOX_H+12} width={40} height={16} rx="4"
-                    fill={done?C.gr+"33":C.gr} stroke={done?C.gr+"66":C.gr} strokeWidth="1"
+                  {/* Row 1: Play / Replay (full width, prominent) */}
+                  <rect x={x+2} y={btnY1} width={BOX_W-4} height={26} rx="7"
+                    fill={done?C.gr+"1e":C.gr} stroke={done?C.gr+"55":"none"} strokeWidth="1"
                     style={{cursor:"pointer"}} onClick={()=>onLaunch(match,{round:ri,match:mi})}/>
-                  <text x={x+22} y={y+BOX_H+21} textAnchor="middle" dominantBaseline="middle"
-                    fill={done?C.gr:"#000"} fontSize="10" fontWeight="800" fontFamily="DM Sans,sans-serif"
-                    style={{cursor:"pointer"}} onClick={()=>onLaunch(match,{round:ri,match:mi})}>{done?"↺▶":"▶"}</text>
+                  <text x={x+BOX_W/2} y={btnY1+13} textAnchor="middle" dominantBaseline="middle"
+                    fill={done?C.gr:"#000"} fontSize="12" fontWeight="800" fontFamily="DM Sans,sans-serif"
+                    style={{pointerEvents:"none"}}>
+                    {done?"↺  REPLAY":"▶  PLAY"}
+                  </text>
+
+                  {/* Row 2: Swap A | Swap B | Bye */}
                   {/* Swap A */}
-                  <rect x={x+44} y={y+BOX_H+12} width={30} height={16} rx="4"
-                    fill={C.purple+"22"} stroke={C.purple+"44"} strokeWidth="1"
+                  <rect x={x+2} y={btnY2} width={bW} height={22} rx="6"
+                    fill={C.purple+"18"} stroke={C.purple+"44"} strokeWidth="1"
                     style={{cursor:"pointer"}} onClick={()=>onSwap({round:ri,match:mi},"A")}/>
-                  <text x={x+59} y={y+BOX_H+21} textAnchor="middle" dominantBaseline="middle"
-                    fill={C.purple} fontSize="9" fontWeight="700" fontFamily="DM Sans,sans-serif"
-                    style={{cursor:"pointer"}} onClick={()=>onSwap({round:ri,match:mi},"A")}>⇄A</text>
+                  <text x={x+2+bW/2} y={btnY2+11} textAnchor="middle" dominantBaseline="middle"
+                    fill={C.purple} fontSize="10" fontWeight="700" fontFamily="DM Sans,sans-serif"
+                    style={{pointerEvents:"none"}}>⇄ A</text>
+
                   {/* Swap B */}
-                  <rect x={x+76} y={y+BOX_H+12} width={30} height={16} rx="4"
-                    fill={C.purple+"22"} stroke={C.purple+"44"} strokeWidth="1"
+                  <rect x={x+4+bW} y={btnY2} width={bW} height={22} rx="6"
+                    fill={C.purple+"18"} stroke={C.purple+"44"} strokeWidth="1"
                     style={{cursor:"pointer"}} onClick={()=>onSwap({round:ri,match:mi},"B")}/>
-                  <text x={x+91} y={y+BOX_H+21} textAnchor="middle" dominantBaseline="middle"
-                    fill={C.purple} fontSize="9" fontWeight="700" fontFamily="DM Sans,sans-serif"
-                    style={{cursor:"pointer"}} onClick={()=>onSwap({round:ri,match:mi},"B")}>⇄B</text>
+                  <text x={x+4+bW+bW/2} y={btnY2+11} textAnchor="middle" dominantBaseline="middle"
+                    fill={C.purple} fontSize="10" fontWeight="700" fontFamily="DM Sans,sans-serif"
+                    style={{pointerEvents:"none"}}>⇄ B</text>
+
                   {/* Bye */}
-                  <rect x={x+108} y={y+BOX_H+12} width={36} height={16} rx="4"
-                    fill={C.orange+"22"} stroke={C.orange+"44"} strokeWidth="1"
+                  <rect x={x+6+bW*2} y={btnY2} width={BOX_W-8-bW*2} height={22} rx="6"
+                    fill={C.orange+"18"} stroke={C.orange+"44"} strokeWidth="1"
                     style={{cursor:"pointer"}} onClick={()=>onBye({round:ri,match:mi},match)}/>
-                  <text x={x+126} y={y+BOX_H+21} textAnchor="middle" dominantBaseline="middle"
-                    fill={C.orange} fontSize="9" fontWeight="700" fontFamily="DM Sans,sans-serif"
-                    style={{cursor:"pointer"}} onClick={()=>onBye({round:ri,match:mi},match)}>BYE</text>
+                  <text x={x+6+bW*2+(BOX_W-8-bW*2)/2} y={btnY2+11} textAnchor="middle" dominantBaseline="middle"
+                    fill={C.orange} fontSize="10" fontWeight="700" fontFamily="DM Sans,sans-serif"
+                    style={{pointerEvents:"none"}}>BYE</text>
                 </g>
               )}
             </g>
@@ -533,7 +465,7 @@ function KnockoutBracket({rounds,isRef,onLaunch,onSwap,onBye}){
 }
 
 // ─── TOURNAMENT VIEW ──────────────────────────────────────────────────────────
-function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSave}){
+export function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSave}){
   const [tourn,setTourn]=useState(null);
   const [tab,setTab]=useState("bracket");
   const [swapModal,setSwapModal]=useState(null);
@@ -569,25 +501,31 @@ function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSav
   const tournRef=useRef(tourn);
   useEffect(()=>{tournRef.current=tourn;},[tourn]);
 
+  // Resolve a match from tournament data using a path.
+  // path.group → group stage; path.ko → knockout phase (qualifier or rr-ko); else → pure KO / RR rounds
+  const resolveMatch=(t,path)=>{
+    if(path.group!==undefined)return t.groups?.[path.group]?.rounds?.[path.round]?.matches?.[path.match];
+    if(path.ko)return t.knockout?.rounds?.[path.round]?.matches?.[path.match];
+    return t.rounds?.[path.round]?.matches?.[path.match];
+  };
+  const propagateAfter=(t,path)=>{
+    if(t.type==="knockout")t.rounds=propagateKnockout(t.rounds||[]);
+    if(path.ko&&t.knockout)t.knockout.rounds=propagateKnockout(t.knockout.rounds||[]);
+  };
+
   // Write result back from a live match to the fixture
   const writeResult=useCallback((path,sets,winnerSide,tA,tB)=>{
     const currentTourn=tournRef.current; // Always latest, no stale closure
     if(!currentTourn||!path)return;
     const t=JSON.parse(JSON.stringify(currentTourn));
-    let match;
-    if(path.group!==undefined){
-      match=t.groups?.[path.group]?.rounds?.[path.round]?.matches?.[path.match];
-    }else{
-      match=t.rounds?.[path.round]?.matches?.[path.match];
-    }
+    const match=resolveMatch(t,path);
     if(!match){console.warn("writeResult: match not found at path",path);return;}
     match.scoreA=sets.filter(s=>s.winner==="A").length;
     match.scoreB=sets.filter(s=>s.winner==="B").length;
     match.setsDetail=sets.map(s=>s.scoreA+"-"+s.scoreB).join(", ");
     match.winner=winnerSide==="A"?tA.name:tB.name;
     match.status="done";
-    if(t.type==="knockout")t.rounds=propagateKnockout(t.rounds||[]);
-    if(t.type==="qualifier"&&path.group===undefined)t.knockout.rounds=propagateKnockout(t.knockout?.rounds||[]);
+    propagateAfter(t,path);
     save(t);
     toast$("✅ Result saved to bracket!");
   },[save,toast$]); // No tourn dependency — uses ref instead
@@ -596,23 +534,25 @@ function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSav
   const writeResultRef=useRef(writeResult);
   useEffect(()=>{writeResultRef.current=writeResult;},[writeResult]);
   useEffect(()=>{
-    window.__writeTourn=(...args)=>writeResultRef.current(...args);
+    window.__writeTourn=(...args)=>{
+      console.log("🎯 __writeTourn bridge fired!", args[0]);
+      writeResultRef.current(...args);
+    };
+    console.log("✅ __writeTourn registered on window");
     return()=>{delete window.__writeTourn;};
   },[]);
 
   const setMatchScore=(path,sA,sB)=>{
     if(!tourn||!isRef)return;
     const t=JSON.parse(JSON.stringify(tourn));
-    let match;
-    if(path.group!==undefined)match=t.groups?.[path.group]?.rounds?.[path.round]?.matches?.[path.match];
-    else match=t.rounds?.[path.round]?.matches?.[path.match];
+    const match=resolveMatch(t,path);
     if(!match)return;
     match.scoreA=sA;match.scoreB=sB;
     const wa=parseInt(sA),wb=parseInt(sB);
     if(!isNaN(wa)&&!isNaN(wb)&&(wa>=21||wb>=21)&&Math.abs(wa-wb)>=2){
       match.winner=wa>wb?match.teamA:match.teamB;match.status="done";
     }else{match.winner=null;match.status="pending";}
-    if(t.type==="knockout")t.rounds=propagateKnockout(t.rounds);
+    propagateAfter(t,path);
     save(t);
   };
 
@@ -632,44 +572,51 @@ function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSav
     if(!swapModal||!tourn)return;
     const{path,slot}=swapModal;
     const t=JSON.parse(JSON.stringify(tourn));
-    let match;
-    if(path.group!==undefined)match=t.groups?.[path.group]?.rounds?.[path.round]?.matches?.[path.match];
-    else match=t.rounds?.[path.round]?.matches?.[path.match];
+    const match=resolveMatch(t,path);
     if(!match){setSwapModal(null);return;}
     if(slot==="A")match.teamA=newTeam;else match.teamB=newTeam;
     match.winner=null;match.status="pending";match.scoreA=null;match.scoreB=null;match.setsDetail="";
-    if(t.type==="knockout")t.rounds=propagateKnockout(t.rounds);
+    propagateAfter(t,path);
     save(t);setSwapModal(null);
   };
 
-  const assignBye=(path,match,advSlot)=>{
+  const assignBye=(path,matchRef,advSlot)=>{
     const t=JSON.parse(JSON.stringify(tourn));
-    let m;
-    if(path.group!==undefined)m=t.groups?.[path.group]?.rounds?.[path.round]?.matches?.[path.match];
-    else m=t.rounds?.[path.round]?.matches?.[path.match];
+    const m=resolveMatch(t,path);
     if(!m){setByeModal(null);return;}
     const adv=advSlot==="A"?m.teamA:m.teamB;
     m.winner=adv;m.status="bye";m.isBye=true;m.scoreA=advSlot==="A"?1:0;m.scoreB=advSlot==="B"?1:0;
-    if(t.type==="knockout")t.rounds=propagateKnockout(t.rounds);
+    propagateAfter(t,path);
     save(t);setByeModal(null);
   };
 
-  const promoteToKnockout=()=>{
-    if(!tourn||tourn.type!=="qualifier")return;
+  // Advance top-N teams from standings into a knockout bracket.
+  // Works for both qualifier (groups) and round-robin (single pool).
+  const promoteToKnockout=(n)=>{
+    if(!tourn)return;
     const t=JSON.parse(JSON.stringify(tourn));
     const allStandings=[];
-    t.groups.forEach((g,gi)=>{
-      const groupTeams=[];
-      g.rounds[0].matches.forEach(m=>{if(m.teamA&&m.teamA!=="TBD")groupTeams.push(m.teamA);if(m.teamB&&m.teamB!=="TBD")groupTeams.push(m.teamB);});
-      const allMatches=g.rounds.flatMap(r=>r.matches);
-      const standings=rrStandingsCalc(allMatches,[...new Set(groupTeams)]);
-      standings.forEach(([name,s],rank)=>allStandings.push({name,pts:s.pts,pd:s.pd,group:gi,rank}));
-    });
+    if(t.type==="qualifier"){
+      t.groups.forEach(g=>{
+        const teamSet=new Set();
+        g.rounds.forEach(r=>r.matches.forEach(m=>{if(!m.isBye){if(m.teamA&&m.teamA!=="TBD")teamSet.add(m.teamA);if(m.teamB&&m.teamB!=="TBD")teamSet.add(m.teamB);}}));
+        const standings=rrStandingsCalc(g.rounds.flatMap(r=>r.matches),[...teamSet]);
+        standings.forEach(([name,s])=>allStandings.push({name,pts:s.pts,pd:s.pd}));
+      });
+    }else if(t.type==="round-robin"){
+      const teamSet=new Set();
+      t.rounds.forEach(r=>r.matches.forEach(m=>{if(!m.isBye){if(m.teamA)teamSet.add(m.teamA);if(m.teamB)teamSet.add(m.teamB);}}));
+      const standings=rrStandingsCalc(t.rounds.flatMap(r=>r.matches),[...teamSet]);
+      standings.forEach(([name,s])=>allStandings.push({name,pts:s.pts,pd:s.pd}));
+    }
     allStandings.sort((a,b)=>b.pts-a.pts||b.pd-a.pd);
-    const qualifiers=allStandings.slice(0,tourn.topN).map(x=>x.name);
-    const ko=buildKnockout(qualifiers);
-    t.knockout=ko;t.groupsDone=true;
-    save(t);toast$(`Top ${tourn.topN} teams advanced!`);
+    const topN=n||tourn.topN||4;
+    const qualifiers=allStandings.slice(0,topN).map(x=>x.name);
+    t.knockout=buildKnockout(qualifiers);
+    t.groupsDone=true;
+    save(t);
+    setTab(t.type==="qualifier"?"bracket":"knockout");
+    toast$(`🏆 Top ${topN} teams advanced to knockout!`);
   };
 
   // Fixture card for list view (RR / groups)
@@ -748,7 +695,7 @@ function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSav
             {format==="qualifier"&&(
               <>
                 <div className="ey" style={{marginTop:8}}>Teams advancing to knockout</div>
-                <div className="cfgr">{[2,4,8].filter(n=>n<=teams.length).map(n=><button key={n} className={`cfgo ${topN===n?"on":""}`} onClick={()=>setTopN(n)}>Top {n}</button>)}</div>
+                <div className="cfgr">{[2,4,8,16].filter(n=>n<teams.length).map(n=><button key={n} className={`cfgo ${topN===n?"on":""}`} onClick={()=>setTopN(n)}>Top {n}</button>)}</div>
               </>
             )}
             <div className="ey" style={{marginTop:8}}>Match format</div>
@@ -763,25 +710,58 @@ function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSav
   const isKO=tourn.type==="knockout";
   const isRR=tourn.type==="round-robin";
   const isQual=tourn.type==="qualifier";
+  const isRRKO=isRR&&!!tourn.knockout; // round-robin that has advanced to knockout phase
 
   const tabs=[];
   if(isKO)tabs.push({id:"bracket",label:"🏆 Bracket"});
-  if(isRR)tabs.push({id:"bracket",label:"📋 Fixtures"},{id:"standings",label:"📊 Standings"});
+  if(isRR){
+    tabs.push({id:"bracket",label:"📋 Fixtures"},{id:"standings",label:"📊 Standings"});
+    if(isRRKO)tabs.push({id:"knockout",label:"🏆 Knockout"});
+  }
   if(isQual)tabs.push({id:"groups",label:"👥 Groups"},{id:"standings",label:"📊 Standings"},{id:"bracket",label:"🏆 Knockout"});
 
   return(
     <>
-      <div className="tabs">{tabs.map(t=><button key={t.id+t.label} className={`tab ${tab===t.id&&tabs.find(x=>x.id===tab)?.label===t.label?"on":""}`} onClick={()=>setTab(t.id)}>{t.label}</button>)}</div>
+      <div className="tabs">{tabs.map(t=><button key={t.id} className={`tab ${tab===t.id?"on":""}`} onClick={()=>setTab(t.id)}>{t.label}</button>)}</div>
 
-      {/* VISUAL KNOCKOUT BRACKET */}
-      {(isKO||(isQual&&tab==="bracket"))&&(
+      {/* PURE KNOCKOUT BRACKET */}
+      {isKO&&(
         <KnockoutBracket
-          rounds={isQual?tourn.knockout?.rounds||[]:tourn.rounds}
+          rounds={tourn.rounds}
           isRef={isRef}
-          teams={teams}
           onLaunch={(match,path)=>launchMatch(match,path)}
           onSwap={(path,slot)=>swapTeam(path,slot)}
           onBye={(path,match)=>setByeModal({path,match})}
+        />
+      )}
+
+      {/* QUALIFIER KNOCKOUT BRACKET */}
+      {isQual&&tab==="bracket"&&(
+        !tourn.groupsDone||!tourn.knockout?(
+          <div className="card p14" style={{textAlign:"center",padding:"28px 16px"}}>
+            <div style={{fontSize:28,marginBottom:8}}>⏳</div>
+            <div style={{fontWeight:700,fontSize:14,marginBottom:6}}>Group Stage Incomplete</div>
+            <div style={{fontSize:12,color:C.txtM}}>Complete group matches, then use <strong>Advance → Knockout</strong> in the Standings tab.</div>
+          </div>
+        ):(
+          <KnockoutBracket
+            rounds={tourn.knockout.rounds}
+            isRef={isRef}
+            onLaunch={(match,path)=>launchMatch(match,{...path,ko:true})}
+            onSwap={(path,slot)=>swapTeam({...path,ko:true},slot)}
+            onBye={(path,match)=>setByeModal({path:{...path,ko:true},match})}
+          />
+        )
+      )}
+
+      {/* ROUND-ROBIN + KNOCKOUT BRACKET */}
+      {isRRKO&&tab==="knockout"&&(
+        <KnockoutBracket
+          rounds={tourn.knockout.rounds}
+          isRef={isRef}
+          onLaunch={(match,path)=>launchMatch(match,{...path,ko:true})}
+          onSwap={(path,slot)=>swapTeam({...path,ko:true},slot)}
+          onBye={(path,match)=>setByeModal({path:{...path,ko:true},match})}
         />
       )}
 
@@ -793,9 +773,26 @@ function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSav
         </div>
       ))}
 
-      {/* RR STANDINGS */}
+      {/* RR STANDINGS + ADVANCE BUTTON */}
       {isRR&&tab==="standings"&&(
-        <div className="card p14"><div className="ey">Standings</div><RRStandings rounds={tourn.rounds} teamNames={teams.map(t=>t.name)}/></div>
+        <>
+          <div className="card p14">
+            <div className="ey">Standings</div>
+            <RRStandings rounds={tourn.rounds} teamNames={teams.map(t=>t.name)}/>
+          </div>
+          {isRef&&!tourn.groupsDone&&(
+            <div className="card p14" style={{marginTop:8}}>
+              <div className="ey">Advance to Knockout</div>
+              <div style={{fontSize:12,color:C.txtM,marginBottom:10}}>Top teams by points (then point difference) advance:</div>
+              <div className="cfgr">
+                {[2,4,8,16].filter(n=>n<teams.length).map(n=>(
+                  <button key={n} className="cfgo" onClick={()=>promoteToKnockout(n)}>Top {n}</button>
+                ))}
+              </div>
+            </div>
+          )}
+          {isRRKO&&<div style={{color:C.gr,fontWeight:700,fontSize:13,textAlign:"center",padding:"8px 0"}}>✅ Teams advanced — see Knockout tab</div>}
+        </>
       )}
 
       {/* QUALIFIER GROUPS */}
@@ -811,20 +808,24 @@ function TournamentView({teams,players,room,isRef,onStartMatch,toast$,onTournSav
         </div>
       ))}
 
-      {/* QUALIFIER STANDINGS */}
+      {/* QUALIFIER STANDINGS + ADVANCE BUTTON */}
       {isQual&&tab==="standings"&&(
         <>
           {tourn.groups.map((g,gi)=>{
-            const groupTeams=[];
-            g.rounds[0].matches.forEach(m=>{if(m.teamA&&m.teamA!=="TBD")groupTeams.push(m.teamA);if(m.teamB&&m.teamB!=="TBD")groupTeams.push(m.teamB);});
+            const teamSet=new Set();
+            g.rounds.forEach(r=>r.matches.forEach(m=>{if(!m.isBye){if(m.teamA&&m.teamA!=="TBD")teamSet.add(m.teamA);if(m.teamB&&m.teamB!=="TBD")teamSet.add(m.teamB);}}));
             return(
               <div key={gi} className="card p14" style={{marginBottom:9}}>
                 <div className="ey">{g.groupName}</div>
-                <RRStandings rounds={g.rounds} teamNames={[...new Set(groupTeams)]}/>
+                <RRStandings rounds={g.rounds} teamNames={[...teamSet]}/>
               </div>
             );
           })}
-          {isRef&&!tourn.groupsDone&&<button className="btn by bfull" style={{marginTop:8}} onClick={promoteToKnockout}>⭐ Advance Top {tourn.topN} → Knockout</button>}
+          {isRef&&!tourn.groupsDone&&(
+            <button className="btn by bfull" style={{marginTop:8}} onClick={()=>promoteToKnockout(tourn.topN)}>
+              ⭐ Advance Top {tourn.topN} → Knockout
+            </button>
+          )}
           {tourn.groupsDone&&<div style={{color:C.gr,fontWeight:700,fontSize:13,textAlign:"center",padding:"8px 0"}}>✅ Teams advanced — see Knockout tab</div>}
         </>
       )}
@@ -1180,8 +1181,13 @@ export default function App(){
         push({teamA,teamB,scoreA:nA,scoreB:nB,sets:ns,serving,winner:m,setsToWin:matchSTW,status:"finished"});
         // ── Write result back to tournament fixture ──
         const path=activeTournPathRef.current;
+        console.log("🏆 MATCH DONE. activeTournPath:", JSON.stringify(activeTournPathRef.current));
+        console.log("🏆 window.__writeTourn exists:", !!window.__writeTourn);
         if(path&&window.__writeTourn){
+          console.log("🏆 Calling writeTourn:", JSON.stringify(path));
           window.__writeTourn(path,ns,m,teamA,teamB);
+        } else {
+          console.log("❌ NOT calling writeTourn. path:", path, "__writeTourn:", !!window.__writeTourn);
         }
       }else{
         setScoreA(0);setScoreB(0);setServing(g);
@@ -1350,7 +1356,7 @@ export default function App(){
 
         {view==="registry"&&<Registry players={players} teams={teams} isRef={isRef} onSavePlayers={p=>{setPlayers(p);savePlayers(room,p);}} onSaveTeams={t=>{setTeams(t);saveTeams(room,t);}}/>}
 
-        {view==="tournament"&&<TournamentView teams={teams} players={players} room={room} isRef={isRef} onStartMatch={onStartMatchFromTourn} toast$={toast$}/>}
+        <div style={{display:view==="tournament"?"":"none"}}><TournamentView teams={teams} players={players} room={room} isRef={isRef} onStartMatch={onStartMatchFromTourn} toast$={toast$}/></div>
 
         {view==="stats"&&<StatsView history={history} players={players}/>}
 
